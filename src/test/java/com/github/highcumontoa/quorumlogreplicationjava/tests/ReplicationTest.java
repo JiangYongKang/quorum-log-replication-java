@@ -102,6 +102,12 @@ class ReplicationTest {
 
         assertEquals(2, r1.commitIndex(), "已提交数据重启后不得丢失");
         assertEquals(2, r2.commitIndex());
+        // 重启后角色均为跟随者，在联系上可信主副本之前不得给出读取结论
+        assertEquals(ErrorCode.STALE_READ,
+                assertThrows(ReplicationException.class, () -> r1.clientRead("k1")).code());
+        // 旧主重新当选并完成一轮复制后，各入口读取恢复且结论一致
+        r1.becomeLeader();
+        c.triggerCatchUp();
         assertEquals("v1", r1.clientRead("k1").orElseThrow());
         assertEquals("v2", r2.clientRead("k2").orElseThrow());
     }
@@ -195,10 +201,13 @@ class ReplicationTest {
         // 已回收前缀中的已提交数据仍可从状态机读取
         assertEquals("v1", leader.clientRead("k1").orElseThrow());
         assertEquals("v10", leader.clientRead("k10").orElseThrow());
-        // 重启后回收状态与数据仍然一致
+        // 重启后回收状态与数据仍然一致；重启节点是跟随者角色，重新当选后读取恢复
         c.crash("n1");
         ReplicaNode r = c.restart("n1");
         assertEquals(10, r.commitIndex());
+        assertEquals(ErrorCode.STALE_READ,
+                assertThrows(ReplicationException.class, () -> r.clientRead("k1")).code());
+        r.becomeLeader();
         assertEquals("v1", r.clientRead("k1").orElseThrow());
     }
 

@@ -103,11 +103,18 @@ class ApiTest {
     void committedDataSurvivesRestartViaApi() throws Exception {
         mvc.perform(post("/api/nodes/n1/crash")).andExpect(status().isOk());
         mvc.perform(post("/api/nodes/n1/restart")).andExpect(status().isOk());
+        // 重启后是跟随者角色，在可信主副本恢复前读取必须明确拒绝，不能凭本地数据下结论
+        mvc.perform(get("/api/nodes/n1/read").param("key", "k1"))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.errorCode").value("STALE_READ"));
+        // 已提交数据未丢失
+        mvc.perform(get("/api/nodes/n1/status"))
+                .andExpect(jsonPath("$.commitIndex").value(1));
+        // 重新当选（成为当前主副本）后读取自动恢复
+        mvc.perform(post("/api/nodes/n1/elect")).andExpect(status().isOk());
         mvc.perform(get("/api/nodes/n1/read").param("key", "k1"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.value").value("v1"));
-        mvc.perform(get("/api/nodes/n1/status"))
-                .andExpect(jsonPath("$.commitIndex").value(1));
     }
 
     @Test

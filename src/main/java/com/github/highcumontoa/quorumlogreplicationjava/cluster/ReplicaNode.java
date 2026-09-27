@@ -50,8 +50,6 @@ public class ReplicaNode {
 
     private volatile Role role = Role.FOLLOWER;
     private volatile boolean running = true;
-    /** 已知自己落后于主副本（前序校验失败或读校验发现），追平前拒绝读取。 */
-    private volatile boolean knownBehind;
 
     /** 已提交状态机。 */
     private final Map<String, String> stateMachine = new LinkedHashMap<>();
@@ -327,13 +325,20 @@ public class ReplicaNode {
     /**
      * 客户端读取：只返回已提交数据，且仅在副本状态可信时返回。
      *
-     * <p>拒绝情形（{@link ErrorCode#STALE_READ}，不改动任何状态）：
+     * <p>跟随者每次读取都向已知主副本做一次实时读校验（read-check），只有
+     * “主副本仍在任，且其提交点不超过本地提交点”时才给出结论——此时本地状态机
+     * 必然包含全部已确认写入，无论键是否存在，结论都与主副本一致。
+     *
+     * <p>拒绝情形（统一为 {@link ErrorCode#STALE_READ}，读路径不做任何状态变更）：
      * <ul>
-     *   <li>不知道当前有效主副本（leaderId 未知，如全新节点）；</li>
-     *   <li>已知自己落后（前序校验失败过，或读校验发现主副本已提交更多）；</li>
-     *   <li>主副本可达且其提交点超过本地——本地结果是半旧数据。</li>
+     *   <li>不知道当前有效主副本（leaderId 未知，如全新/重建节点）；</li>
+     *   <li>主副本暂时不可达（网络隔离、崩溃），无法确认本地是否已追平；</li>
+     *   <li>已知主副本已卸任（任期变更/主副本更替）；</li>
+     *   <li>主副本可达但其提交点高于本地——本地是半旧数据（含漏掉已确认写入的情况）。</li>
      * </ul>
-     * 主副本不可达或已卸任时，本地已提交数据仍是多数派持久化的安全结果，照常返回。
+     * 因此落后副本在主副本不可达时既不会把缺失键误报为“不存在”，也不会对旧键
+     * 返回可能已被覆盖的旧值。主副本恢复并完成一次重新同步后，读校验自然通过，
+     * 读取自动恢复，“暂时无法确认”不会被缓存为空值或落后标记。
      */
     public synchronized Optional<String> clientRead(String key) {
         checkRunning();
@@ -351,32 +356,47 @@ public class ReplicaNode {
         String leader = leaderId();
         if (leader == null) {
             throw new ReplicationException(ErrorCode.STALE_READ,
-                    "节点 " + id + " 尚不知道当前主副本，读取不可信");
-        }
-        if (knownBehind) {
-            throw new ReplicationException(ErrorCode.STALE_READ,
-                    "节点 " + id + " 落后于主副本，追平前读取不可信");
+                    "节点 " + id + " 尚不知道当前主副本，无法确认读取结论");
         }
         if (leader.equals(id)) {
-            return; // 自己曾是主副本（重启后），本地已提交数据安全
+            // 重启后的旧主：角色已是跟随者，不能再凭“自己曾是主”给出结论，
+            // 必须重新当选或联系上当前主副本
+            throw new ReplicationException(ErrorCode.STALE_READ,
+                    "节点 " + id + " 已不是当前主副本，无法确认读取结论");
         }
+        long localCommit = commitIndex();
         Transport.ReadCheckResponse resp;
         try {
             resp = transport.readCheck(leader, new Transport.ReadCheckRequest(currentTerm(), id));
         } catch (ReplicationException e) {
-            return; // 主副本不可达：已提交数据仍是安全结果
-        }
-        if (resp.isLeader() && resp.commitIndex() > commitIndex()) {
-            knownBehind = true;
+            // 主副本不可达：本地可能漏掉已确认写入（存在与否都无法确认），必须拒绝
             throw new ReplicationException(ErrorCode.STALE_READ,
-                    "节点 " + id + " 落后于主副本已确认写入: commitIndex=" + commitIndex()
-                            + " < " + resp.commitIndex());
+                    "节点 " + id + " 暂时联系不上主副本 " + leader
+                            + "，无法确认本地是否已追平，拒绝读取", e);
         }
+        if (resp.term() > currentTerm()) {
+            // 集群已进入更高任期：不在读路径改状态，直接拒绝，待复制/心跳自然收敛
+            throw new ReplicationException(ErrorCode.STALE_READ,
+                    "节点 " + id + " 任期落后于主副本 term=" + resp.term()
+                            + " > " + currentTerm() + "，拒绝读取");
+        }
+        if (!resp.isLeader()) {
+            throw new ReplicationException(ErrorCode.STALE_READ,
+                    "已知主副本 " + leader + " 已卸任，当前主副本未知，拒绝读取");
+        }
+        if (resp.commitIndex() > localCommit) {
+            throw new ReplicationException(ErrorCode.STALE_READ,
+                    "节点 " + id + " 落后于主副本已确认写入: commitIndex=" + localCommit
+                            + " < " + resp.commitIndex() + "，追平前拒绝读取");
+        }
+        // 主副本仍在任且本地提交点 >= 主副本提交点：本地已包含全部已确认写入，
+        // 命中即权威值，未命中即权威的“键不存在”。
     }
 
-    /** 读校验：只读应答，不改变任何状态。 */
-    public synchronized Transport.ReadCheckResponse onReadCheck(Transport.ReadCheckRequest req) {
+    /** 读校验应答：纯只读方法，刻意不加节点锁，避免与复制路径形成锁序死锁。 */
+    public Transport.ReadCheckResponse onReadCheck(Transport.ReadCheckRequest req) {
         checkRunning();
+        // role/currentTerm/commitIndex 均为易失读或 MetaStore 同步读，调用方只做水位比较
         return new Transport.ReadCheckResponse(currentTerm(), role == Role.LEADER, commitIndex());
     }
 
@@ -413,7 +433,6 @@ public class ReplicaNode {
         stateMachine.putAll(req.state());
         appliedIndex = idx;
         dedup.entrySet().removeIf(e -> e.getValue().index() <= idx);
-        knownBehind = false;
         return new Transport.SnapshotResponse(currentTerm(), true, idx);
     }
 
@@ -438,20 +457,18 @@ public class ReplicaNode {
         metaStore.leaderId(req.leaderId());
         this.role = Role.FOLLOWER;
 
-        // 前序一致性检查：失败说明本地历史不足，明确知道自己落后
+        // 前序一致性检查：失败说明本地历史不足，主副本按响应回退补齐即可；
+        // 是否落后由读取时的实时读校验判定，这里不保留任何“落后”状态
         if (req.prevLogIndex() > logStore.lastIndex()) {
-            knownBehind = true;
             return new Transport.AppendResponse(currentTerm(), false, logStore.lastIndex());
         }
         if (req.prevLogIndex() == logStore.baseIndex()) {
             if (req.prevLogTerm() != logStore.baseTerm()) {
-                knownBehind = true;
                 return new Transport.AppendResponse(currentTerm(), false, logStore.lastIndex());
             }
         } else if (req.prevLogIndex() > logStore.baseIndex()) {
             Optional<LogEntry> prev = logStore.get(req.prevLogIndex());
             if (prev.isEmpty() || prev.get().term() != req.prevLogTerm()) {
-                knownBehind = true;
                 return new Transport.AppendResponse(currentTerm(), false, logStore.lastIndex());
             }
         }
@@ -481,7 +498,6 @@ public class ReplicaNode {
             metaStore.commitIndex(Math.min(req.leaderCommit(), lastNew));
             applyCommitted();
         }
-        knownBehind = false;
         return new Transport.AppendResponse(currentTerm(), true, Math.max(lastNew, logStore.lastIndex()));
     }
 

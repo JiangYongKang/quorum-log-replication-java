@@ -138,7 +138,8 @@ class ContentAndLimitTest {
             }
         }
 
-        // 全部崩溃重启：内容不得丢失或截断，日志范围自洽
+        // 全部崩溃重启：内容不得丢失或截断，日志范围自洽；
+        // 重启后均为跟随者，追平到重新当选的主副本后读取才可信，且内容逐字一致
         for (String id : IDS) {
             cluster.crash(id);
         }
@@ -147,6 +148,16 @@ class ContentAndLimitTest {
             assertEquals(contents.size(), n.commitIndex(), id + " 重启后提交点自洽");
             assertTrue(n.logStore().lastIndex() >= n.logStore().baseIndex(),
                     id + " 日志范围自洽");
+            assertEquals(ErrorCode.STALE_READ,
+                    assertThrows(ReplicationException.class,
+                            () -> n.clientRead(contents.keySet().iterator().next())).code(),
+                    id + " 重启后可信主副本恢复前不得给出读取结论");
+        }
+        ReplicaNode leaderAgain = cluster.node("n1");
+        leaderAgain.becomeLeader();
+        cluster.triggerCatchUp();
+        for (String id : IDS) {
+            ReplicaNode n = cluster.node(id);
             for (Map.Entry<String, String> e : contents.entrySet()) {
                 assertEquals(e.getValue(), n.clientRead(e.getKey()).orElseThrow(),
                         id + " 重启后读取键 [" + e.getKey() + "] 必须逐字一致");

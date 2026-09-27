@@ -6,7 +6,7 @@
 ## 构建与测试
 
 ```bash
-mvn test          # 运行全部测试（30 个用例）
+mvn test          # 运行全部测试（33 个用例）
 mvn spring-boot:run   # 启动 REST 服务（默认 8080）
 ```
 
@@ -33,13 +33,27 @@ config/   可配置项与集群装配
 
 - **写入**：仅主副本受理。条目先持久化入队，复制到多数派（含自己）后才推进 `commitIndex`
   并对外确认；未达多数派抛出 `NO_MAJORITY`，条目保持未提交、对读不可见。
-- **读取**：committed-read + 可信校验——任何副本只返回已提交状态机内容，绝不暴露未提交条目；
-  且仅当副本状态足以给出可信结论时才返回：
-  - 不知道当前有效主副本（`leaderId` 未知，如全新/重建节点）→ 拒绝 `STALE_READ`；
-  - 已知自己落后（复制前序校验失败过，或读校验发现主副本已提交更多）→ 拒绝 `STALE_READ`；
-  - 主副本可达且其 `commitIndex` 超过本地（半旧数据）→ 拒绝 `STALE_READ`；
-  - 主副本不可达或已卸任时，本地已提交数据是多数派持久化的安全结果，照常返回。
-  被拒绝的读取不改动任何状态；副本重新同步后读取自动恢复。响应携带 `commitIndex` 便于校验。
+- **读取**：committed-read + 实时可信校验——任何副本只返回已提交状态机内容，绝不暴露
+  未提交条目；跟随者每次读取都向已知主副本发一次只读的读校验（read-check），仅当
+  “主副本仍在任，且其提交点不超过本地提交点”时才返回内容：此时本地状态机必然包含
+  全部已确认写入，命中返回权威值，未命中返回权威的“键不存在”（HTTP 200, `ok:false`）。
+  状态不足以给出可信结论时，**无论键新旧、本地是否恰好有值**，一律拒绝 `STALE_READ`
+  （HTTP 409），绝不把“暂时无法确认”当成空值或旧值返回。拒绝情形包括：
+  - 不知道当前有效主副本（`leaderId` 未知，如全新/空目录重建节点）；
+  - 主副本暂时联系不上（网络隔离、崩溃）——本地可能漏掉其离线期间已对外确认的写入；
+  - 已知主副本已卸任（返回 `isLeader=false`，如主副本更替后）；
+  - 本地任期落后（主副本返回更高任期）；
+  - 主副本可达但提交点高于本地——本地是半旧数据（含漏掉已确认写入的情况）。
+  注意：“本地存着多数派确认过的数据”并不能证明之后没有更新的已确认写入，因此
+  主副本不可达时**不再**放行读取。拒绝是纯只读操作，不推进提交点、不改状态机、
+  不写入任何“落后/空值”标记；读校验应答方法本身不加节点锁，避免与复制路径形成
+  锁序死锁。
+- **读取恢复**：判定完全基于当次实时读校验，不缓存“无法确认”。主副本恢复后由新写入、
+  `POST /api/cluster/sync` 或下一轮复制完成重新同步（必要时走快照），本地提交点追平，
+  下一次读校验即通过，读取自动恢复，返回内容与提交结论和主副本一致，不会一直拒绝。
+  崩溃重启后的旧主角色为跟随者，在重新当选或联系上当前主副本之前同样拒绝读取。
+- **错误区分**：`STALE_READ`(409，状态不足) 与“键确实不存在”(200, `ok:false,value:null`)、
+  `INVALID_ARGUMENT`(400，如空 key)、`NOT_LEADER`/`REPLICA_UNREACHABLE` 等均可区分。
 - **幂等**：同一 `requestId` 重复到达直接返回首次结果，不重复追加、不重复推进提交点。
 - **并发**：副本内所有变更串行化，索引严格连续，提交点单调推进，无跳变/错位/半更新。
 
@@ -131,6 +145,23 @@ curl -X POST localhost:8080/api/nodes/n3/rebuild     # 空目录重建
 curl 'localhost:8080/api/nodes/n3/read?key=k1'       # 409 STALE_READ（尚未同步）
 curl -X POST localhost:8080/api/cluster/sync         # 触发快照/日志追平
 curl 'localhost:8080/api/nodes/n3/read?key=k1'       # 恢复正常，与主副本一致
+
+# 复现：主副本暂时联系不上且本地落后时，读取必须明确拒绝，恢复后自动恢复
+curl -X POST localhost:8080/api/nodes/n1/elect
+curl -X POST localhost:8080/api/nodes/n1/write -H 'Content-Type: application/json' \
+     -d '{"requestId":"a1","key":"k1","value":"v1"}'
+curl -X POST 'localhost:8080/api/nodes/n3/reachable?value=false'   # 隔离 n3
+curl -X POST localhost:8080/api/nodes/n1/write -H 'Content-Type: application/json' \
+     -d '{"requestId":"a2","key":"k2","value":"v2"}'                # n3 漏掉的已确认写入
+curl -X POST 'localhost:8080/api/nodes/n3/reachable?value=true'
+curl -X POST 'localhost:8080/api/nodes/n1/reachable?value=false'   # 主副本暂时联系不上
+curl -i 'localhost:8080/api/nodes/n3/read?key=k2'   # 409 STALE_READ，不再误报“不存在”
+curl -i 'localhost:8080/api/nodes/n3/read?key=k1'   # 409 STALE_READ，旧键也不给旧结论
+curl -i 'localhost:8080/api/nodes/n3/read?key='     # 400 INVALID_ARGUMENT，原因可区分
+curl -X POST 'localhost:8080/api/nodes/n1/reachable?value=true'
+curl -X POST localhost:8080/api/cluster/sync        # 主副本恢复并完成重新同步
+curl 'localhost:8080/api/nodes/n3/read?key=k2'      # 200 v2，读取自动恢复
+curl 'localhost:8080/api/nodes/n3/read?key=nope'    # 200 {"ok":false,...}，真不存在才可空
 ```
 
 自动化测试覆盖（`src/test/.../tests/`）：
@@ -140,11 +171,15 @@ curl 'localhost:8080/api/nodes/n3/read?key=k1'       # 恢复正常，与主副�
 - `ContentAndLimitTest`：中文/emoji/长文本逐字往返、超限写入以 `PAYLOAD_TOO_LARGE`
   拒绝且无副作用、回收+重启后内容完整、多字节内容下日志偏移正确；
 - `SnapshotSyncTest`：历史被回收干净的副本经快照追平、空目录重建副本追平、
-  追平与写入/回收并发进行；
+  主副本不可达期间落后副本拒绝读取且无副作用、追平与写入/回收并发进行；
 - `ReadTrustTest`：未知主副本拒绝读取、落后副本拒绝并在同步后恢复、
-  已提交数据在主副本不可达时仍可读；
+  **主副本联系不上且本地落后时新旧键一律 `STALE_READ`（拒绝无副作用）并在主副本恢复、
+  重新同步后自动恢复**、主副本崩溃/节点重启链路下拒绝直至信任恢复；
+- `ReadConcurrencyTest`：写入并发期间跟随者读到的任何值都与主副本已提交结论一致
+  （不返回半旧结果）、追平后各入口与主副本对齐、读写交叉不发生锁序死锁；
 - `ConcurrencyTest`：8 线程并发写入，索引连续无跳变、各副本状态机一致；
-- `ApiTest`：REST 入口下写入/读取/幂等/错误码（含 413 与 STALE_READ）与核心层结论一致。
+- `ApiTest`：REST 入口下写入/读取/幂等/错误码（含 413 与 STALE_READ、重启后先拒绝
+  再恢复）与核心层结论一致。
 
 ## 兼容范围
 
