@@ -9,6 +9,9 @@ public class ReplicationProperties {
     /** 日志保留的最大条目数，超过则回收已提交前缀。 */
     private long maxLogEntries = 1000;
 
+    /** 单条写入的最大字节数（按 UTF-8 编码后的 requestId+key+value 合计计算），超过则拒绝。 */
+    private int maxEntryBytes = 1024 * 1024;
+
     /** 数据目录。 */
     private String dataDir = "data";
 
@@ -18,6 +21,14 @@ public class ReplicationProperties {
 
     public void setMaxLogEntries(long maxLogEntries) {
         this.maxLogEntries = maxLogEntries;
+    }
+
+    public int getMaxEntryBytes() {
+        return maxEntryBytes;
+    }
+
+    public void setMaxEntryBytes(int maxEntryBytes) {
+        this.maxEntryBytes = maxEntryBytes;
     }
 
     public String getDataDir() {

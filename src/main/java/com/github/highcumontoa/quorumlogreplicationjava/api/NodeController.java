@@ -58,6 +58,8 @@ public class NodeController {
         m.put("commitIndex", node.commitIndex());
         m.put("lastIndex", node.logStore().lastIndex());
         m.put("baseIndex", node.logStore().baseIndex());
+        m.put("baseTerm", node.logStore().baseTerm());
+        m.put("stateMachineSize", node.stateMachine().size());
         m.put("stateMachine", node.stateMachine());
         return m;
     }

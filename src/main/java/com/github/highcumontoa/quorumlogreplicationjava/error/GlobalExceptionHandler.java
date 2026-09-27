@@ -12,17 +12,18 @@ import java.util.Map;
 @RestControllerAdvice
 public class GlobalExceptionHandler {
 
-    private static final Map<ErrorCode, HttpStatus> STATUS = Map.of(
-            ErrorCode.NOT_LEADER, HttpStatus.CONFLICT,
-            ErrorCode.NO_MAJORITY, HttpStatus.SERVICE_UNAVAILABLE,
-            ErrorCode.TERM_MISMATCH, HttpStatus.CONFLICT,
-            ErrorCode.LOG_MISMATCH, HttpStatus.CONFLICT,
-            ErrorCode.STALE_READ, HttpStatus.CONFLICT,
-            ErrorCode.INVALID_ARGUMENT, HttpStatus.BAD_REQUEST,
-            ErrorCode.LOG_CORRUPTED, HttpStatus.INTERNAL_SERVER_ERROR,
-            ErrorCode.REPLICA_UNREACHABLE, HttpStatus.SERVICE_UNAVAILABLE,
-            ErrorCode.RESOURCE_EXHAUSTED, HttpStatus.INSUFFICIENT_STORAGE,
-            ErrorCode.INTERNAL, HttpStatus.INTERNAL_SERVER_ERROR);
+    private static final Map<ErrorCode, HttpStatus> STATUS = Map.ofEntries(
+            Map.entry(ErrorCode.NOT_LEADER, HttpStatus.CONFLICT),
+            Map.entry(ErrorCode.NO_MAJORITY, HttpStatus.SERVICE_UNAVAILABLE),
+            Map.entry(ErrorCode.TERM_MISMATCH, HttpStatus.CONFLICT),
+            Map.entry(ErrorCode.LOG_MISMATCH, HttpStatus.CONFLICT),
+            Map.entry(ErrorCode.STALE_READ, HttpStatus.CONFLICT),
+            Map.entry(ErrorCode.INVALID_ARGUMENT, HttpStatus.BAD_REQUEST),
+            Map.entry(ErrorCode.LOG_CORRUPTED, HttpStatus.INTERNAL_SERVER_ERROR),
+            Map.entry(ErrorCode.REPLICA_UNREACHABLE, HttpStatus.SERVICE_UNAVAILABLE),
+            Map.entry(ErrorCode.RESOURCE_EXHAUSTED, HttpStatus.INSUFFICIENT_STORAGE),
+            Map.entry(ErrorCode.ENTRY_TOO_LARGE, HttpStatus.PAYLOAD_TOO_LARGE),
+            Map.entry(ErrorCode.INTERNAL, HttpStatus.INTERNAL_SERVER_ERROR));
 
     @ExceptionHandler(ReplicationException.class)
     public ResponseEntity<Map<String, Object>> handle(ReplicationException ex) {

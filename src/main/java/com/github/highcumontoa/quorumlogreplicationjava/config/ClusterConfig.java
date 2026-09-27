@@ -16,6 +16,6 @@ public class ClusterConfig {
     @Bean(destroyMethod = "close")
     public Cluster cluster(ReplicationProperties props) {
         return new Cluster(List.of("n1", "n2", "n3"),
-                Path.of(props.getDataDir()), props.getMaxLogEntries());
+                Path.of(props.getDataDir()), props.getMaxLogEntries(), props.getMaxEntryBytes());
     }
 }

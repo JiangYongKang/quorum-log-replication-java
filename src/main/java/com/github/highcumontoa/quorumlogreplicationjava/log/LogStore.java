@@ -46,6 +46,11 @@ public class LogStore {
             Files.createDirectories(dir);
             this.file = dir.resolve("log.dat");
             this.baseFile = dir.resolve("log.base");
+            // 清理上次崩溃可能残留的临时日志/基址文件（正式文件始终以原子替换发布）
+            Files.deleteIfExists(dir.resolve("log.dat.tmp"));
+            Files.deleteIfExists(dir.resolve("log.dat.tmp.base.tmp"));
+            Files.deleteIfExists(dir.resolve("log.dat.reset"));
+            Files.deleteIfExists(dir.resolve("log.dat.reset.base.tmp"));
             boolean exists = Files.exists(file);
             this.raf = new RandomAccessFile(file.toFile(), "rw");
             if (Files.exists(baseFile)) {
@@ -212,24 +217,62 @@ public class LogStore {
             fresh.close();
             raf.close();
             Files.move(tmp, file, StandardCopyOption.REPLACE_EXISTING);
+            Files.move(tmp.resolveSibling("log.dat.tmp.base.tmp"), baseFile,
+                    StandardCopyOption.REPLACE_EXISTING);
             this.raf = new RandomAccessFile(file.toFile(), "rw");
             this.raf.seek(raf.length());
         } catch (IOException e) {
             throw new ReplicationException(ErrorCode.INTERNAL, "日志前缀回收失败", e);
         }
-        persistBase(newBase, entries.get(pos - 1).term());
+        this.baseIndex = newBase;
+        this.baseTerm = entries.get(pos - 1).term();
         entries.clear();
         entries.addAll(kept);
         offsets.clear();
         long off = 0;
         for (LogEntry e : entries) {
             offsets.add(off);
-            off += HEADER + e.requestId().length() + e.key().length() + e.value().length();
+            off += HEADER + utf8Len(e.requestId()) + utf8Len(e.key()) + utf8Len(e.value());
         }
     }
 
-    private void persistBase(long index, long term) {
-        this.baseIndex = index;
+    private static int utf8Len(String s) {
+        return s.getBytes(StandardCharsets.UTF_8).length;
+    }
+
+    /**
+     * 快照安装：丢弃全部本地日志，把基址推进到 {@code (baseIndex, baseTerm)}。
+     *
+     * <p>用于“历史已完全不可用”的副本追平：先由调用方把快照状态落盘，再以临时文件
+     * 原子替换日志，替换成功前内存视图保持不变，不会暴露半旧数据。
+     */
+    public synchronized void resetToSnapshot(long newBaseIndex, long newBaseTerm) {
+        if (newBaseIndex < baseIndex) {
+            throw new ReplicationException(ErrorCode.LOG_MISMATCH,
+                    "快照基址不得回退: 当前 " + baseIndex + " 快照 " + newBaseIndex);
+        }
+        try {
+            Path tmp = file.resolveSibling("log.dat.reset");
+            Files.deleteIfExists(tmp);
+            LogStore fresh = new LogStore(tmp.getParent(), "log.dat.reset");
+            fresh.persistBase(newBaseIndex, newBaseTerm);
+            fresh.close();
+            raf.close();
+            Files.move(tmp, file, StandardCopyOption.REPLACE_EXISTING);
+            Files.move(tmp.resolveSibling("log.dat.reset.base.tmp"), baseFile,
+                    StandardCopyOption.REPLACE_EXISTING);
+            this.raf = new RandomAccessFile(file.toFile(), "rw");
+            this.raf.seek(0);
+        } catch (IOException e) {
+            throw new ReplicationException(ErrorCode.INTERNAL, "日志快照重置失败", e);
+        }
+        this.baseIndex = newBaseIndex;
+        this.baseTerm = newBaseTerm;
+        entries.clear();
+        offsets.clear();
+    }
+
+    private void persistBase(long index, long term) {        this.baseIndex = index;
         this.baseTerm = term;
         try {
             Files.write(baseFile, ByteBuffer.allocate(16).putLong(index).putLong(term).array());

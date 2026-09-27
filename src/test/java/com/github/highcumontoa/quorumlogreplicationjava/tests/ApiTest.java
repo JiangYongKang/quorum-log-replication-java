@@ -33,6 +33,7 @@ class ApiTest {
     static void props(DynamicPropertyRegistry registry) {
         registry.add("replication.data-dir", () -> dataDir.toString());
         registry.add("replication.max-log-entries", () -> "1000");
+        registry.add("replication.max-entry-bytes", () -> "64");
     }
 
     @Autowired
@@ -102,10 +103,50 @@ class ApiTest {
     void committedDataSurvivesRestartViaApi() throws Exception {
         mvc.perform(post("/api/nodes/n1/crash")).andExpect(status().isOk());
         mvc.perform(post("/api/nodes/n1/restart")).andExpect(status().isOk());
+        // 重启后尚未确认有效主副本：读取被明确拒绝，而不是伪装成“键不存在”
+        mvc.perform(get("/api/nodes/n1/read").param("key", "k1"))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.errorCode").value("STALE_READ"));
+        // 重新选主（恢复可信状态）后读取自动恢复
+        mvc.perform(post("/api/nodes/n1/elect")).andExpect(status().isOk());
         mvc.perform(get("/api/nodes/n1/read").param("key", "k1"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.value").value("v1"));
         mvc.perform(get("/api/nodes/n1/status"))
                 .andExpect(jsonPath("$.commitIndex").value(1));
+    }
+
+    @Test
+    @Order(7)
+    void oversizedWriteIsRejectedWithDistinctError() throws Exception {
+        // 恢复 order 5 中崩溃的跟随者，恢复多数派
+        mvc.perform(post("/api/nodes/n2/restart")).andExpect(status().isOk());
+        mvc.perform(post("/api/nodes/n3/restart")).andExpect(status().isOk());
+        // n1 在 order 6 重新成为主副本；UTF-8 中文每字 3 字节，30 字约 90 字节 > 64
+        String big = "中".repeat(30);
+        mvc.perform(post("/api/nodes/n1/write").contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"requestId\":\"r-big\",\"key\":\"kbig\",\"value\":\"" + big + "\"}"))
+                .andExpect(status().isPayloadTooLarge())
+                .andExpect(jsonPath("$.errorCode").value("ENTRY_TOO_LARGE"));
+        // 拒绝不留痕：查不到该键，提交点不变
+        mvc.perform(get("/api/nodes/n1/read").param("key", "kbig"))
+                .andExpect(jsonPath("$.ok").value(false));
+        mvc.perform(get("/api/nodes/n1/status"))
+                .andExpect(jsonPath("$.commitIndex").value(1));
+        // 同 requestId 以合规大小重提成功
+        mvc.perform(post("/api/nodes/n1/write").contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"requestId\":\"r-big\",\"key\":\"kbig\",\"value\":\"小\"}"))
+                .andExpect(status().isOk());
+    }
+
+    @Test
+    @Order(8)
+    void followerUnknownLeaderReadIsRejectedAsStale() throws Exception {
+        // 重启 n3 后其尚未接触主副本，读取被明确拒绝而非返回空值
+        mvc.perform(post("/api/nodes/n3/crash")).andExpect(status().isOk());
+        mvc.perform(post("/api/nodes/n3/restart")).andExpect(status().isOk());
+        mvc.perform(get("/api/nodes/n3/read").param("key", "k1"))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.errorCode").value("STALE_READ"));
     }
 }

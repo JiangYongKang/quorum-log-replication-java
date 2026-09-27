@@ -17,22 +17,30 @@ public class Cluster implements AutoCloseable {
     private final List<String> nodeIds;
     private final Path rootDir;
     private final long maxLogEntries;
+    private final int maxEntryBytes;
     private final Map<String, ReplicaNode> nodes = new ConcurrentHashMap<>();
     private final Set<String> unreachable = ConcurrentHashMap.newKeySet();
     private final Transport transport = new InProcessTransport();
 
-    public Cluster(List<String> nodeIds, Path rootDir, long maxLogEntries) {
+    public Cluster(List<String> nodeIds, Path rootDir, long maxLogEntries, int maxEntryBytes) {
         this.nodeIds = List.copyOf(nodeIds);
         this.rootDir = rootDir;
         this.maxLogEntries = maxLogEntries;
+        this.maxEntryBytes = maxEntryBytes;
         for (String id : nodeIds) {
             nodes.put(id, createNode(id));
         }
     }
 
+    /** 兼容入口：单条写入大小上限使用默认值 1 MiB。 */
+    public Cluster(List<String> nodeIds, Path rootDir, long maxLogEntries) {
+        this(nodeIds, rootDir, maxLogEntries, 1024 * 1024);
+    }
+
     private ReplicaNode createNode(String id) {
         List<String> peers = nodeIds.stream().filter(n -> !n.equals(id)).toList();
-        return new ReplicaNode(id, peers, rootDir.resolve(id), transport, maxLogEntries);
+        return new ReplicaNode(id, peers, rootDir.resolve(id), transport,
+                maxLogEntries, maxEntryBytes);
     }
 
     public ReplicaNode node(String id) {
@@ -93,6 +101,34 @@ public class Cluster implements AutoCloseable {
                         "节点 " + targetId + " 不存在");
             }
             return target.onAppend(request);
+        }
+
+        @Override
+        public SnapshotResponse installSnapshot(String targetId, SnapshotRequest request) {
+            if (unreachable.contains(targetId)) {
+                throw new ReplicationException(ErrorCode.REPLICA_UNREACHABLE,
+                        "节点 " + targetId + " 不可达");
+            }
+            ReplicaNode target = nodes.get(targetId);
+            if (target == null) {
+                throw new ReplicationException(ErrorCode.REPLICA_UNREACHABLE,
+                        "节点 " + targetId + " 不存在");
+            }
+            return target.onInstallSnapshot(request);
+        }
+
+        @Override
+        public ReadIndexResponse queryReadIndex(String targetId, ReadIndexRequest request) {
+            if (unreachable.contains(targetId)) {
+                throw new ReplicationException(ErrorCode.REPLICA_UNREACHABLE,
+                        "节点 " + targetId + " 不可达");
+            }
+            ReplicaNode target = nodes.get(targetId);
+            if (target == null) {
+                throw new ReplicationException(ErrorCode.REPLICA_UNREACHABLE,
+                        "节点 " + targetId + " 不存在");
+            }
+            return target.onReadIndex(request);
         }
 
         @Override

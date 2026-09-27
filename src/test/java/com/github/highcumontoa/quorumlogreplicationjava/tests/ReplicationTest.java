@@ -79,7 +79,10 @@ class ReplicationTest {
         c.restart("n2");
         c.restart("n3");
         assertEquals(0, c.node("n2").commitIndex());
-        assertTrue(c.node("n2").clientRead("k2").isEmpty());
+        // 重启后的跟随者尚不知道有效主副本，读取被明确拒绝（STALE_READ），而不是返回空值伪装“不存在”
+        ReplicationException stale = assertThrows(ReplicationException.class,
+                () -> c.node("n2").clientRead("k2"));
+        assertEquals(ErrorCode.STALE_READ, stale.code());
     }
 
     @Test
@@ -99,7 +102,13 @@ class ReplicationTest {
 
         assertEquals(2, r1.commitIndex(), "已提交数据重启后不得丢失");
         assertEquals(2, r2.commitIndex());
+        // 重启后、重新确认主副本前，跟随者读取不可信
+        assertEquals(ErrorCode.STALE_READ, assertThrows(ReplicationException.class,
+                () -> r2.clientRead("k2")).code());
+        // 重新选主（上任心跳使跟随者重新同步），读取自动恢复且数据逐字来自磁盘
+        r1.becomeLeader();
         assertEquals("v1", r1.clientRead("k1").orElseThrow());
+        assertEquals("v1", r2.clientRead("k1").orElseThrow());
         assertEquals("v2", r2.clientRead("k2").orElseThrow());
     }
 
@@ -114,11 +123,14 @@ class ReplicationTest {
         leader.clientWrite("req-2", "k2", "v2"); // n2+n1 多数派
         ReplicaNode n3 = c.restart("n3");
         log.info("n3 恢复时 commitIndex={} lastIndex={}", n3.commitIndex(), n3.logStore().lastIndex());
-        assertTrue(n3.clientRead("k2").isEmpty(), "补齐期间不得读到未提交数据");
+        // 补齐期间副本落后于主提交点：读取被明确拒绝，绝不暴露未提交/半旧数据
+        ReplicationException stale = assertThrows(ReplicationException.class,
+                () -> n3.clientRead("k2"));
+        assertEquals(ErrorCode.STALE_READ, stale.code());
 
         leader.clientWrite("req-3", "k3", "v3"); // 触发对 n3 的补齐
         assertEquals(3, n3.commitIndex());
-        assertEquals("v2", n3.clientRead("k2").orElseThrow(), "补齐后应可读");
+        assertEquals("v2", n3.clientRead("k2").orElseThrow(), "补齐后读取自动恢复");
         assertEquals("v3", n3.clientRead("k3").orElseThrow());
     }
 
@@ -190,11 +202,13 @@ class ReplicationTest {
         // 已回收前缀中的已提交数据仍可从状态机读取
         assertEquals("v1", leader.clientRead("k1").orElseThrow());
         assertEquals("v10", leader.clientRead("k10").orElseThrow());
-        // 重启后回收状态与数据仍然一致
+        // 重启后回收状态与数据仍然一致：重新选主后读取恢复
         c.crash("n1");
         ReplicaNode r = c.restart("n1");
+        r.becomeLeader();
         assertEquals(10, r.commitIndex());
         assertEquals("v1", r.clientRead("k1").orElseThrow());
+        assertEquals("v10", r.clientRead("k10").orElseThrow());
     }
 
     @Test

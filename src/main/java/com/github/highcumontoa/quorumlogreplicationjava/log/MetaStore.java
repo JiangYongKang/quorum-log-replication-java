@@ -25,6 +25,7 @@ public class MetaStore {
         try {
             Files.createDirectories(dir);
             this.file = dir.resolve("meta.properties");
+            Files.deleteIfExists(file.resolveSibling("meta.properties.tmp"));
             if (Files.exists(file)) {
                 Properties p = new Properties();
                 try (InputStream in = Files.newInputStream(file)) {

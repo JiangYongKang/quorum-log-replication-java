@@ -14,6 +14,7 @@ import java.io.OutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.charset.StandardCharsets;
 import java.util.Properties;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -43,6 +44,7 @@ public class ReplicaNode {
     private final int clusterSize;
     private final Transport transport;
     private final long maxLogEntries;
+    private final int maxEntryBytes;
     private final LogStore logStore;
     private final MetaStore metaStore;
     private final Path stateFile;
@@ -60,12 +62,13 @@ public class ReplicaNode {
     private final Map<String, Long> nextIndex = new HashMap<>();
 
     public ReplicaNode(String id, List<String> peers, Path dataDir, Transport transport,
-                       long maxLogEntries) {
+                       long maxLogEntries, int maxEntryBytes) {
         this.id = id;
         this.peers = List.copyOf(peers);
         this.clusterSize = peers.size() + 1;
         this.transport = transport;
         this.maxLogEntries = maxLogEntries;
+        this.maxEntryBytes = maxEntryBytes;
         this.logStore = new LogStore(dataDir);
         this.metaStore = new MetaStore(dataDir);
         this.stateFile = dataDir.resolve("state.properties");
@@ -136,6 +139,10 @@ public class ReplicaNode {
             nextIndex.put(p, next);
         }
         log.info("[{}] 成为主副本 term={} lastIndex={}", id, currentTerm(), logStore.lastIndex());
+        // 上任即广播空心跳：让在线跟随者立刻确认当前主副本（其读取随之恢复可信）
+        for (String p : peers) {
+            replicateTo(p);
+        }
     }
 
     /** 降级为跟随者。 */
@@ -162,6 +169,14 @@ public class ReplicaNode {
         if (role != Role.LEADER) {
             throw new ReplicationException(ErrorCode.NOT_LEADER,
                     "节点 " + id + " 不是主副本, leader=" + leaderId);
+        }
+        int writeBytes = requestId.getBytes(StandardCharsets.UTF_8).length
+                + key.getBytes(StandardCharsets.UTF_8).length
+                + value.getBytes(StandardCharsets.UTF_8).length;
+        if (writeBytes > maxEntryBytes) {
+            log.warn("[{}] 写入超限被拒绝 bytes={} max={} key={}", id, writeBytes, maxEntryBytes, key);
+            throw new ReplicationException(ErrorCode.ENTRY_TOO_LARGE,
+                    "单条写入超限: bytes=" + writeBytes + " max=" + maxEntryBytes);
         }
         enforceRetention();
         LogEntry entry = new LogEntry(currentTerm(), logStore.lastIndex() + 1, requestId, key, value);
@@ -196,12 +211,18 @@ public class ReplicaNode {
     private boolean replicateTo(String peer) {
         while (true) {
             long ni = nextIndex.getOrDefault(peer, logStore.lastIndex() + 1);
+            // 跟随者需要的起点已在主副本回收点之前：日志补不了，改发快照
+            if (ni <= logStore.baseIndex()) {
+                if (!sendSnapshot(peer)) {
+                    return false;
+                }
+                // 即便快照已覆盖全部日志，也继续走一轮空批次，让跟随者确认主副本并对齐提交点
+                ni = logStore.baseIndex() + 1;
+            }
             long prevIndex = ni - 1;
             long prevTerm;
             if (prevIndex == logStore.baseIndex()) {
                 prevTerm = logStore.baseTerm();
-            } else if (prevIndex < logStore.baseIndex()) {
-                prevTerm = 0;
             } else {
                 prevTerm = logStore.get(prevIndex).map(LogEntry::term).orElse(0L);
             }
@@ -226,15 +247,49 @@ public class ReplicaNode {
                 }
                 continue; // 还有剩余条目
             }
-            // 日志前序不匹配：回退一格重试；已触底仍被拒绝则放弃（需要快照恢复，超出本机模拟范围）
+            // 日志前序不匹配：回退一格重试；回退到基址仍失败则发快照（本地历史已不可用的副本）
             long floor = logStore.baseIndex() + 1;
             if (ni <= floor) {
-                log.warn("[{}] 跟随者 {} 前序检查在基址处仍失败, 放弃本轮复制", id, peer);
+                if (logStore.baseIndex() > 0) {
+                    log.info("[{}] 跟随者 {} 前序在基址处仍不匹配, 改用快照追平", id, peer);
+                    if (!sendSnapshot(peer)) {
+                        return false;
+                    }
+                    // 回到循环顶部走空批次（日志已空时）或剩余日志复制
+                    nextIndex.put(peer, floor);
+                    continue;
+                }
+                log.warn("[{}] 跟随者 {} 前序检查在起点处仍失败, 放弃本轮复制", id, peer);
                 return false;
             }
-            nextIndex.put(peer, Math.max(floor, ni - 1));
+            nextIndex.put(peer, ni - 1);
             log.info("[{}] 跟随者 {} 日志不匹配, 回退 nextIndex={}", id, peer, ni - 1);
         }
+    }
+
+    /** 向历史完全不可用的跟随者发送已提交状态机快照。 */
+    private boolean sendSnapshot(String peer) {
+        Transport.SnapshotRequest req = new Transport.SnapshotRequest(
+                currentTerm(), id, logStore.baseIndex(), logStore.baseTerm(),
+                Map.copyOf(stateMachine));
+        Transport.SnapshotResponse resp;
+        try {
+            resp = transport.installSnapshot(peer, req);
+        } catch (ReplicationException e) {
+            log.warn("[{}] 快照发送到 {} 失败: {}", id, peer, e.getMessage());
+            return false;
+        }
+        if (resp.term() > currentTerm()) {
+            stepDown(resp.term());
+            return false;
+        }
+        if (!resp.success()) {
+            log.warn("[{}] 快照被 {} 拒绝 term={}", id, peer, resp.term());
+            return false;
+        }
+        nextIndex.put(peer, Math.max(resp.matchIndex() + 1, logStore.baseIndex() + 1));
+        log.info("[{}] 快照已安装到 {} snapshotIndex={}", id, peer, resp.matchIndex());
+        return true;
     }
 
     private void advanceCommit(long index) {
@@ -271,11 +326,46 @@ public class ReplicaNode {
         }
     }
 
-    /** 客户端读取：只返回已提交数据。 */
+    /**
+     * 客户端读取：只返回可信的已提交数据（read-index + committed-read）。
+     *
+     * <p>主副本直接读本地已提交状态机；跟随者先向主副本确认当前已提交点
+     * （read-index），本地提交点追平后才应答。不知道有效主副本、主副本不可达、
+     * 或本地明显落后时抛出 {@link ErrorCode#STALE_READ}，绝不把“状态不足”
+     * 伪装成“键不存在”。
+     */
     public synchronized Optional<String> clientRead(String key) {
         checkRunning();
         if (key == null || key.isBlank()) {
             throw new ReplicationException(ErrorCode.INVALID_ARGUMENT, "key 不能为空");
+        }
+        if (role != Role.LEADER) {
+            if (leaderId == null) {
+                throw new ReplicationException(ErrorCode.STALE_READ,
+                        "节点 " + id + " 不知道当前有效的主副本, 读取结果不可信");
+            }
+            Transport.ReadIndexResponse ri;
+            try {
+                ri = transport.queryReadIndex(leaderId,
+                        new Transport.ReadIndexRequest(currentTerm(), id));
+            } catch (ReplicationException e) {
+                throw new ReplicationException(ErrorCode.STALE_READ,
+                        "无法向主副本 " + leaderId + " 确认已提交点: " + e.getMessage());
+            }
+            if (ri.term() > currentTerm()) {
+                stepDown(ri.term());
+                throw new ReplicationException(ErrorCode.STALE_READ,
+                        "主副本任期更高, 本节点状态待更新");
+            }
+            if (ri.leaderId() == null) {
+                throw new ReplicationException(ErrorCode.STALE_READ,
+                        "主副本 " + leaderId + " 已失效, 读取结果不可信");
+            }
+            if (commitIndex() < ri.commitIndex()) {
+                throw new ReplicationException(ErrorCode.STALE_READ,
+                        "本节点落后于已确认写入: localCommit=" + commitIndex()
+                                + " leaderCommit=" + ri.commitIndex());
+            }
         }
         return Optional.ofNullable(stateMachine.get(key));
     }
@@ -336,10 +426,61 @@ public class ReplicaNode {
         return new Transport.AppendResponse(currentTerm(), true, Math.max(lastNew, logStore.lastIndex()));
     }
 
+    /**
+     * 处理主副本的快照安装：本地历史已完全不可用时的追平入口。
+     *
+     * <p>落盘顺序保证崩溃安全：先写状态快照，再推进提交点，最后原子替换日志。
+     * 全部持久化成功后才切换内存视图，过程中不对外暴露未提交或半旧数据。
+     */
+    public synchronized Transport.SnapshotResponse onInstallSnapshot(Transport.SnapshotRequest req) {
+        checkRunning();
+        if (req.term() < currentTerm()) {
+            log.warn("[{}] 拒绝过期任期快照 term={} 当前 term={}", id, req.term(), currentTerm());
+            return new Transport.SnapshotResponse(currentTerm(), false, logStore.lastIndex());
+        }
+        if (req.term() > currentTerm()) {
+            stepDown(req.term());
+        }
+        this.leaderId = req.leaderId();
+        this.role = Role.FOLLOWER;
+        if (req.lastIncludedIndex() <= logStore.baseIndex()
+                || req.lastIncludedIndex() <= metaStore.commitIndex()) {
+            // 已覆盖的旧快照，幂等应答
+            return new Transport.SnapshotResponse(currentTerm(), true, logStore.lastIndex());
+        }
+        Map<String, String> snapshot = new LinkedHashMap<>(req.state());
+        saveSnapshotFrom(snapshot);
+        metaStore.commitIndex(req.lastIncludedIndex());
+        logStore.resetToSnapshot(req.lastIncludedIndex(), req.lastIncludedTerm());
+        stateMachine.clear();
+        stateMachine.putAll(snapshot);
+        appliedIndex = req.lastIncludedIndex();
+        dedup.clear();
+        log.info("[{}] 快照安装完成 snapshotIndex={} term={}", id,
+                req.lastIncludedIndex(), req.lastIncludedTerm());
+        return new Transport.SnapshotResponse(currentTerm(), true, req.lastIncludedIndex());
+    }
+
+    /** read-index：仅当前任主副本应答，返回其已知的已提交点。 */
+    public synchronized Transport.ReadIndexResponse onReadIndex(Transport.ReadIndexRequest req) {
+        checkRunning();
+        if (req.term() > currentTerm()) {
+            stepDown(req.term());
+        }
+        if (role != Role.LEADER) {
+            return new Transport.ReadIndexResponse(currentTerm(), null, -1L);
+        }
+        return new Transport.ReadIndexResponse(currentTerm(), id, commitIndex());
+    }
+
     /** 回收前把已提交状态机落盘，保证重启后已提交数据不丢。 */
     private void saveSnapshot() {
+        saveSnapshotFrom(stateMachine);
+    }
+
+    private void saveSnapshotFrom(Map<String, String> state) {
         Properties p = new Properties();
-        stateMachine.forEach((k, v) -> p.setProperty(k, v));
+        state.forEach(p::setProperty);
         Path tmp = stateFile.resolveSibling("state.properties.tmp");
         try (OutputStream out = Files.newOutputStream(tmp)) {
             p.store(out, null);
@@ -350,6 +491,11 @@ public class ReplicaNode {
     }
 
     private void loadSnapshot() {
+        try {
+            Files.deleteIfExists(stateFile.resolveSibling("state.properties.tmp"));
+        } catch (IOException e) {
+            throw new ReplicationException(ErrorCode.INTERNAL, "清理快照临时文件失败", e);
+        }
         if (!Files.exists(stateFile)) {
             return;
         }

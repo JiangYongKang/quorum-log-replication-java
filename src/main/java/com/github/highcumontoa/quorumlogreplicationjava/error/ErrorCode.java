@@ -11,5 +11,6 @@ public enum ErrorCode {
     LOG_CORRUPTED,
     REPLICA_UNREACHABLE,
     RESOURCE_EXHAUSTED,
+    ENTRY_TOO_LARGE,
     INTERNAL
 }
