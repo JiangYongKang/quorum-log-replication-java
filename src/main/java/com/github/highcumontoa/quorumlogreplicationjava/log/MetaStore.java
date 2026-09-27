@@ -20,6 +20,8 @@ public class MetaStore {
     private long currentTerm;
     private String votedFor;
     private long commitIndex;
+    /** 最近一次确认的主副本（用于重启后的可信读取判定）。 */
+    private String leaderId;
 
     public MetaStore(Path dir) {
         try {
@@ -33,6 +35,7 @@ public class MetaStore {
                 this.currentTerm = Long.parseLong(p.getProperty("currentTerm", "0"));
                 this.votedFor = p.getProperty("votedFor", null);
                 this.commitIndex = Long.parseLong(p.getProperty("commitIndex", "0"));
+                this.leaderId = p.getProperty("leaderId", null);
             }
         } catch (IOException | NumberFormatException e) {
             throw new ReplicationException(ErrorCode.LOG_CORRUPTED, "元数据文件损坏: " + dir, e);
@@ -46,6 +49,9 @@ public class MetaStore {
             p.setProperty("votedFor", votedFor);
         }
         p.setProperty("commitIndex", String.valueOf(commitIndex));
+        if (leaderId != null) {
+            p.setProperty("leaderId", leaderId);
+        }
         Path tmp = file.resolveSibling("meta.properties.tmp");
         try (OutputStream out = Files.newOutputStream(tmp)) {
             p.store(out, null);
@@ -70,6 +76,15 @@ public class MetaStore {
 
     public synchronized void votedFor(String nodeId) {
         this.votedFor = nodeId;
+        persist();
+    }
+
+    public synchronized String leaderId() {
+        return leaderId;
+    }
+
+    public synchronized void leaderId(String nodeId) {
+        this.leaderId = nodeId;
         persist();
     }
 

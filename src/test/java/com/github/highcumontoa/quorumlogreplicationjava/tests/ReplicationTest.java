@@ -79,7 +79,10 @@ class ReplicationTest {
         c.restart("n2");
         c.restart("n3");
         assertEquals(0, c.node("n2").commitIndex());
-        assertTrue(c.node("n2").clientRead("k2").isEmpty());
+        // n2 从未与主副本建立过联系（leaderId 未知），读取必须被明确拒绝而非返回空值
+        ReplicationException stale = assertThrows(ReplicationException.class,
+                () -> c.node("n2").clientRead("k2"));
+        assertEquals(ErrorCode.STALE_READ, stale.code());
     }
 
     @Test
@@ -114,7 +117,9 @@ class ReplicationTest {
         leader.clientWrite("req-2", "k2", "v2"); // n2+n1 多数派
         ReplicaNode n3 = c.restart("n3");
         log.info("n3 恢复时 commitIndex={} lastIndex={}", n3.commitIndex(), n3.logStore().lastIndex());
-        assertTrue(n3.clientRead("k2").isEmpty(), "补齐期间不得读到未提交数据");
+        // 补齐期间 n3 明显落后于已对外确认的写入，读取必须被拒绝而不是返回空值
+        ReplicationException stale = assertThrows(ReplicationException.class, () -> n3.clientRead("k2"));
+        assertEquals(ErrorCode.STALE_READ, stale.code());
 
         leader.clientWrite("req-3", "k3", "v3"); // 触发对 n3 的补齐
         assertEquals(3, n3.commitIndex());

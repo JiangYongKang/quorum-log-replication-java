@@ -33,6 +33,7 @@ class ApiTest {
     static void props(DynamicPropertyRegistry registry) {
         registry.add("replication.data-dir", () -> dataDir.toString());
         registry.add("replication.max-log-entries", () -> "1000");
+        registry.add("replication.max-write-bytes", () -> "16");
     }
 
     @Autowired
@@ -106,6 +107,41 @@ class ApiTest {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.value").value("v1"));
         mvc.perform(get("/api/nodes/n1/status"))
+                .andExpect(jsonPath("$.commitIndex").value(1));
+    }
+
+    @Test
+    @Order(7)
+    void oversizedWriteIsRejectedWithDistinctErrorViaApi() throws Exception {
+        mvc.perform(post("/api/nodes/n2/restart")).andExpect(status().isOk());
+        mvc.perform(post("/api/nodes/n3/restart")).andExpect(status().isOk());
+        mvc.perform(post("/api/nodes/n1/elect")).andExpect(status().isOk());
+        mvc.perform(post("/api/nodes/n1/write").contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"requestId\":\"r-big\",\"key\":\"kb\",\"value\":\""
+                                + "x".repeat(100) + "\"}"))
+                .andExpect(status().isPayloadTooLarge())
+                .andExpect(jsonPath("$.errorCode").value("PAYLOAD_TOO_LARGE"));
+        // 拒绝不留半成品：提交点与既有数据不变
+        mvc.perform(get("/api/nodes/n1/status"))
+                .andExpect(jsonPath("$.commitIndex").value(1));
+        mvc.perform(get("/api/nodes/n1/read").param("key", "kb"))
+                .andExpect(jsonPath("$.ok").value(false));
+    }
+
+    @Test
+    @Order(8)
+    void rebuiltNodeRejectsReadUntilSyncedViaApi() throws Exception {
+        // 空目录重建：不知道主副本，读取被明确拒绝而不是返回空值
+        mvc.perform(post("/api/nodes/n3/rebuild")).andExpect(status().isOk());
+        mvc.perform(get("/api/nodes/n3/read").param("key", "k1"))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.errorCode").value("STALE_READ"));
+        // 触发追平后读取自动恢复，且与主副本一致
+        mvc.perform(post("/api/cluster/sync")).andExpect(status().isOk());
+        mvc.perform(get("/api/nodes/n3/read").param("key", "k1"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.value").value("v1"));
+        mvc.perform(get("/api/nodes/n3/status"))
                 .andExpect(jsonPath("$.commitIndex").value(1));
     }
 }

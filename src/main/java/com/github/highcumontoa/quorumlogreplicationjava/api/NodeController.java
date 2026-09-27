@@ -84,6 +84,20 @@ public class NodeController {
         return status(id);
     }
 
+    /** 运维：清空数据目录重建副本（历史完全丢失后重新加入）。 */
+    @PostMapping("/nodes/{id}/rebuild")
+    public Map<String, Object> rebuild(@PathVariable String id) {
+        cluster.rebuild(id);
+        return status(id);
+    }
+
+    /** 运维：主副本立即对所有跟随者发起一轮复制/快照追平。 */
+    @PostMapping("/cluster/sync")
+    public Map<String, String> sync() {
+        cluster.triggerCatchUp();
+        return Map.of("ok", "true");
+    }
+
     /** 运维：网络隔离/恢复。 */
     @PostMapping("/nodes/{id}/reachable")
     public Map<String, String> reachable(@PathVariable String id, @RequestParam boolean value) {

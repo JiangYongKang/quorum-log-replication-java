@@ -174,6 +174,18 @@ public class LogStore {
         return (pos < 0 || pos >= entries.size()) ? -1 : pos;
     }
 
+    /** 快照安装：清空全部条目并把日志基址设置为 (index, term)。 */
+    public synchronized void resetToBase(long index, long term) {
+        try {
+            truncateFile(0);
+        } catch (IOException e) {
+            throw new ReplicationException(ErrorCode.INTERNAL, "日志重置失败", e);
+        }
+        entries.clear();
+        offsets.clear();
+        persistBase(index, term);
+    }
+
     /** 删除 index 及之后的所有条目（冲突截断）。 */
     public synchronized void truncateSuffix(long index) {
         int pos = toPos(index);
@@ -212,6 +224,7 @@ public class LogStore {
             fresh.close();
             raf.close();
             Files.move(tmp, file, StandardCopyOption.REPLACE_EXISTING);
+            Files.deleteIfExists(tmp.getParent().resolve("log.dat.tmp.base.tmp"));
             this.raf = new RandomAccessFile(file.toFile(), "rw");
             this.raf.seek(raf.length());
         } catch (IOException e) {
@@ -224,7 +237,9 @@ public class LogStore {
         long off = 0;
         for (LogEntry e : entries) {
             offsets.add(off);
-            off += HEADER + e.requestId().length() + e.key().length() + e.value().length();
+            off += HEADER + e.requestId().getBytes(StandardCharsets.UTF_8).length
+                    + e.key().getBytes(StandardCharsets.UTF_8).length
+                    + e.value().getBytes(StandardCharsets.UTF_8).length;
         }
     }
 
