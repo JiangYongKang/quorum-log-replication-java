@@ -103,6 +103,12 @@ class ApiTest {
     void committedDataSurvivesRestartViaApi() throws Exception {
         mvc.perform(post("/api/nodes/n1/crash")).andExpect(status().isOk());
         mvc.perform(post("/api/nodes/n1/restart")).andExpect(status().isOk());
+        // 重启后没有当前主副本：状态不足，读取被明确拒绝（而不是凭本地数据下结论）
+        mvc.perform(get("/api/nodes/n1/read").param("key", "k1"))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.errorCode").value("STALE_READ"));
+        // 重新选主后读取自动恢复，已提交数据不丢
+        mvc.perform(post("/api/nodes/n1/elect")).andExpect(status().isOk());
         mvc.perform(get("/api/nodes/n1/read").param("key", "k1"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.value").value("v1"));
@@ -143,5 +149,46 @@ class ApiTest {
                 .andExpect(jsonPath("$.value").value("v1"));
         mvc.perform(get("/api/nodes/n3/status"))
                 .andExpect(jsonPath("$.commitIndex").value(1));
+    }
+
+    @Test
+    @Order(9)
+    void staleReadWhenLeaderUnreachableThenRecoversViaApi() throws Exception {
+        // 端到端复现用户场景：n3 隔离期间漏掉已确认写入，随后主副本暂时联系不上。
+        // 此时读漏掉的新键必须是 409 STALE_READ，而不是 200 {ok:false}（"键不存在"）；
+        // 读本地旧键同样被拒绝。恢复并追平后自动恢复，新旧键与主副本一致。
+        mvc.perform(post("/api/nodes/n3/reachable").param("value", "false")).andExpect(status().isOk());
+        mvc.perform(post("/api/nodes/n1/write").contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"requestId\":\"r-lag\",\"key\":\"kl\",\"value\":\"vl\"}"))
+                .andExpect(status().isOk());
+        mvc.perform(post("/api/nodes/n3/reachable").param("value", "true")).andExpect(status().isOk());
+        mvc.perform(post("/api/nodes/n1/crash")).andExpect(status().isOk());
+
+        // 漏掉的已提交新键：不是"不存在"，而是明确的 STALE_READ（可与参数错误区分）
+        mvc.perform(get("/api/nodes/n3/read").param("key", "kl"))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.ok").value(false))
+                .andExpect(jsonPath("$.errorCode").value("STALE_READ"));
+        // 本地旧键：状态不足也必须拒绝
+        mvc.perform(get("/api/nodes/n3/read").param("key", "k1"))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.errorCode").value("STALE_READ"));
+
+        // 主副本恢复并重新同步
+        mvc.perform(post("/api/nodes/n1/restart")).andExpect(status().isOk());
+        mvc.perform(post("/api/nodes/n1/elect")).andExpect(status().isOk());
+        mvc.perform(post("/api/cluster/sync")).andExpect(status().isOk());
+
+        mvc.perform(get("/api/nodes/n3/read").param("key", "kl"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.ok").value(true))
+                .andExpect(jsonPath("$.value").value("vl"));
+        mvc.perform(get("/api/nodes/n3/read").param("key", "k1"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.value").value("v1"));
+        // 真正不存在的键：追平后才返回 ok:false，语义与 STALE_READ 明确分开
+        mvc.perform(get("/api/nodes/n3/read").param("key", "missing-key"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.ok").value(false));
     }
 }

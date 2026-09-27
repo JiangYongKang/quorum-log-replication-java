@@ -138,12 +138,23 @@ class ContentAndLimitTest {
             }
         }
 
-        // 全部崩溃重启：内容不得丢失或截断，日志范围自洽
+        // 全部崩溃重启：内容不得丢失或截断，日志范围自洽。
+        // 重启后没有当前主副本，读取先被拒绝；重新选主并追平后内容逐字可读
         for (String id : IDS) {
             cluster.crash(id);
         }
+        ReplicaNode restartedLeader = cluster.restart("n1");
+        cluster.restart("n2");
+        cluster.restart("n3");
+        for (String id : List.of("n2", "n3")) {
+            ReplicationException stale = assertThrows(ReplicationException.class,
+                    () -> cluster.node(id).clientRead(contents.keySet().iterator().next()));
+            assertEquals(ErrorCode.STALE_READ, stale.code());
+        }
+        restartedLeader.becomeLeader();
+        cluster.triggerCatchUp();
         for (String id : IDS) {
-            ReplicaNode n = cluster.restart(id);
+            ReplicaNode n = cluster.node(id);
             assertEquals(contents.size(), n.commitIndex(), id + " 重启后提交点自洽");
             assertTrue(n.logStore().lastIndex() >= n.logStore().baseIndex(),
                     id + " 日志范围自洽");

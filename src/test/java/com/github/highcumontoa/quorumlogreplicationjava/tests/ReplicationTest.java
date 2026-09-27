@@ -102,6 +102,16 @@ class ReplicationTest {
 
         assertEquals(2, r1.commitIndex(), "已提交数据重启后不得丢失");
         assertEquals(2, r2.commitIndex());
+
+        // 全员重启后没有当前主副本：任何节点都无法证明自己处于最新已提交水位，
+        // 读取必须明确拒绝（STALE_READ），而不是凭本地旧数据直接下结论
+        for (ReplicaNode n : List.of(r1, r2, c.node("n3"))) {
+            ReplicationException stale = assertThrows(ReplicationException.class,
+                    () -> n.clientRead("k1"));
+            assertEquals(ErrorCode.STALE_READ, stale.code());
+        }
+        // 重新选主后读取自动恢复，已提交数据逐字仍在
+        r1.becomeLeader();
         assertEquals("v1", r1.clientRead("k1").orElseThrow());
         assertEquals("v2", r2.clientRead("k2").orElseThrow());
     }
@@ -195,10 +205,15 @@ class ReplicationTest {
         // 已回收前缀中的已提交数据仍可从状态机读取
         assertEquals("v1", leader.clientRead("k1").orElseThrow());
         assertEquals("v10", leader.clientRead("k10").orElseThrow());
-        // 重启后回收状态与数据仍然一致
+        // 重启后回收状态与数据仍然一致；重启后角色重置为跟随者，
+        // 需重新选主（联系上当前主副本确认水位）后读取才可信
         c.crash("n1");
         ReplicaNode r = c.restart("n1");
         assertEquals(10, r.commitIndex());
+        ReplicationException stale = assertThrows(ReplicationException.class,
+                () -> r.clientRead("k1"));
+        assertEquals(ErrorCode.STALE_READ, stale.code());
+        r.becomeLeader();
         assertEquals("v1", r.clientRead("k1").orElseThrow());
     }
 

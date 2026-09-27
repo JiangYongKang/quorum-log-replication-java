@@ -29,7 +29,10 @@ import java.util.Optional;
  * <p>一致性语义：
  * <ul>
  *   <li>写入仅由主副本受理，获得多数派确认后才推进提交点并对外确认；</li>
- *   <li>读取只返回已提交状态机内容（committed-read），任何角色都不会暴露未提交条目；</li>
+ *   <li>读取只返回已提交状态机内容（committed-read），任何角色都不会暴露未提交条目；
+ *       跟随者只有在成功联系上当前主副本并确认本地提交点不低于其已提交水位（已追平）
+ *       时才返回内容，主副本不可达/未知主副本/已知落后一律拒绝（STALE_READ），
+ *       绝不把"暂时无法确认"当成"键不存在"，且读取不产生任何状态副作用；</li>
  *   <li>任期低于当前任期的复制请求被拒绝，日志前序不匹配时由主副本回退补齐；</li>
  *   <li>相同 requestId 的重复写入直接返回首次结果，不重复追加。</li>
  * </ul>
@@ -325,52 +328,81 @@ public class ReplicaNode {
     }
 
     /**
-     * 客户端读取：只返回已提交数据，且仅在副本状态可信时返回。
+     * 客户端读取：只返回已提交数据，且仅在副本状态足以给出可信结论时返回。
      *
-     * <p>拒绝情形（{@link ErrorCode#STALE_READ}，不改动任何状态）：
+     * <p>拒绝情形（统一为 {@link ErrorCode#STALE_READ}，可与 {@code INVALID_ARGUMENT}、
+     * 键确实不存在（正常返回 {@code ok:false}）及其它拒绝原因区分）：
      * <ul>
-     *   <li>不知道当前有效主副本（leaderId 未知，如全新节点）；</li>
-     *   <li>已知自己落后（前序校验失败过，或读校验发现主副本已提交更多）；</li>
-     *   <li>主副本可达且其提交点超过本地——本地结果是半旧数据。</li>
+     *   <li>跟随者不知道当前有效主副本（{@code leaderId} 未知，如全新/重建节点）；</li>
+     *   <li>跟随者已知自己落后（复制前序校验失败过，尚未追平）；</li>
+     *   <li>已知主副本联系不上（崩溃/网络隔离）——无法证明本地已追平到最新已提交状态，
+     *       即使本地存有旧的已提交数据也不能据此对"新键不存在"下结论；</li>
+     *   <li>主副本可达但已卸任（不是当前任期主副本）；</li>
+     *   <li>主副本可达但其提交点超过本地——本地是半旧数据。</li>
      * </ul>
-     * 主副本不可达或已卸任时，本地已提交数据仍是多数派持久化的安全结果，照常返回。
+     * 只有两种情况放行：节点本身就是当前主副本；或者跟随者成功联系上当前主副本，
+     * 且本地提交点不低于主副本的已提交水位（即已追平）。
+     *
+     * <p>本方法（含读校验）不改动任何已提交结果或副本状态，尤其不会把"暂时无法确认"
+     * 缓存成空值或落后标记；主副本恢复并完成一次重新同步后读取自动恢复。
      */
-    public synchronized Optional<String> clientRead(String key) {
+    public Optional<String> clientRead(String key) {
         checkRunning();
         if (key == null || key.isBlank()) {
             throw new ReplicationException(ErrorCode.INVALID_ARGUMENT, "key 不能为空");
         }
-        checkReadTrusted();
-        return Optional.ofNullable(stateMachine.get(key));
-    }
-
-    private void checkReadTrusted() {
-        if (role == Role.LEADER) {
-            return; // 主副本自身即提交结论的来源
+        // 读校验所需的快照在锁内取得；RPC 必须在锁外发起，避免与主副本写入路径
+        // 形成锁顺序环（跟随者锁→主副本锁 vs 主副本锁→跟随者锁）导致并发死锁
+        String leader;
+        long localTerm;
+        boolean behind;
+        synchronized (this) {
+            if (role == Role.LEADER) {
+                return Optional.ofNullable(stateMachine.get(key)); // 当前主副本即提交结论来源
+            }
+            leader = leaderId();
+            localTerm = currentTerm();
+            behind = knownBehind;
         }
-        String leader = leaderId();
         if (leader == null) {
             throw new ReplicationException(ErrorCode.STALE_READ,
                     "节点 " + id + " 尚不知道当前主副本，读取不可信");
         }
-        if (knownBehind) {
+        if (behind) {
             throw new ReplicationException(ErrorCode.STALE_READ,
                     "节点 " + id + " 落后于主副本，追平前读取不可信");
         }
-        if (leader.equals(id)) {
-            return; // 自己曾是主副本（重启后），本地已提交数据安全
-        }
+        // 注意：leader.equals(id) 也不能放行——重启后角色已重置为跟随者，
+        // 必须经当前主副本确认水位，否则崩溃期间可能漏掉已确认写入。
         Transport.ReadCheckResponse resp;
         try {
-            resp = transport.readCheck(leader, new Transport.ReadCheckRequest(currentTerm(), id));
+            resp = transport.readCheck(leader, new Transport.ReadCheckRequest(localTerm, id));
         } catch (ReplicationException e) {
-            return; // 主副本不可达：已提交数据仍是安全结果
-        }
-        if (resp.isLeader() && resp.commitIndex() > commitIndex()) {
-            knownBehind = true;
+            // 主副本联系不上：无法证明本地已追平到最新已提交状态。
+            // 本地旧数据对"新键不存在"没有发言权，必须明确拒绝而非返回空值。
             throw new ReplicationException(ErrorCode.STALE_READ,
-                    "节点 " + id + " 落后于主副本已确认写入: commitIndex=" + commitIndex()
-                            + " < " + resp.commitIndex());
+                    "节点 " + id + " 暂时无法联系主副本 " + leader
+                            + " 确认提交水位，读取不可信: " + e.getMessage());
+        }
+        if (!resp.isLeader()) {
+            // 已知的主副本已卸任或发生过主副本更替：拒绝，待复制流量带来新的主副本信息
+            throw new ReplicationException(ErrorCode.STALE_READ,
+                    "节点 " + leader + " 已不是当前主副本，读取不可信");
+        }
+        // 重新加锁复核：RPC 期间可能已有复制/快照把本地推进，以锁内最新状态为准。
+        // 只拒绝本次读取，不写任何标记（追平状态只由复制/快照路径维护，读取零副作用）。
+        synchronized (this) {
+            if (role == Role.LEADER) {
+                return Optional.ofNullable(stateMachine.get(key));
+            }
+            long currentCommit = commitIndex();
+            if (resp.commitIndex() > currentCommit) {
+                throw new ReplicationException(ErrorCode.STALE_READ,
+                        "节点 " + id + " 落后于主副本已确认写入: commitIndex=" + currentCommit
+                                + " < " + resp.commitIndex());
+            }
+            // 主副本确认当前任期有效且本地提交点不低于其水位：已追平，结论可信
+            return Optional.ofNullable(stateMachine.get(key));
         }
     }
 
